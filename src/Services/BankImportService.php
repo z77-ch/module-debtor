@@ -1,0 +1,617 @@
+<?php
+
+namespace Z77\Module\Debtor\Services;
+
+use Doctrine\DBAL\Exception\UniqueConstraintViolationException;
+use Z77\Module\Debtor\Entities\BankMessage;
+use Z77\Module\Debtor\Entities\BankTransaction;
+use Z77\Module\Debtor\Entities\DebtorProfile;
+use Z77\Module\Debtor\Entities\Invoice;
+use Z77\Module\Debtor\Entities\InvoiceKind;
+use Z77\Module\Debtor\Entities\PaymentTarget;
+use Z77\Module\Debtor\Entities\TransactionState;
+use Z77\Module\Debtor\Invoicing\QrReferenceLayout;
+use Z77\Module\Debtor\Payments\CamtEntry;
+use Z77\Module\Debtor\Payments\CamtReader;
+use Z77\Module\Debtor\Payments\PaymentDraft;
+use Z77\Module\Debtor\Repositories\BankMessageRepository;
+use Z77\Module\Debtor\Repositories\BankTransactionRepository;
+use Z77\Module\Debtor\Repositories\DebtorProfileRepository;
+use Z77\Module\Debtor\Repositories\InvoiceRepository;
+use Z77\Module\Debtor\Repositories\PaymentTargetRepository;
+use Z77\Persistence\Resolver\UnifiedEntityManager;
+use Z77\Shared\Money\Money;
+use Z77\Shared\Payment\Iban;
+use Z77\Shared\Payment\QrReference;
+
+/**
+ * The CAMT.054 import (plan §6.4, P4 part 2): a bank's credit notification
+ * becomes a {@see BankMessage} with its {@see BankTransaction}s, each
+ * MATCHED to a final invoice where the file says which one, and later
+ * BOOKED — a {@see \Z77\Module\Debtor\Entities\Payment} per transaction
+ * through `PaymentService::record()`, the one write path for settlements,
+ * all of a message in ONE unit of work.
+ *
+ * Steps, and the rules that hold no matter which screen or script calls:
+ *
+ *   - **import** — the file is read ({@see CamtReader}), the message id is
+ *     the dedup key (the same message twice is refused and names the
+ *     earlier import), the IBAN must be an ACTIVE payment target's (plain
+ *     or QR-IBAN — that target's ledger account takes the money; an
+ *     account the office does not keep here is refused), every entry is
+ *     stored: a debit, a reversal, a credit in another currency goes in
+ *     as `ignored` with the reason, so the file is complete on the screen;
+ *     the bank's transaction reference is unique within the message (the
+ *     second dedup key — a bank that lists one credit twice is caught);
+ *     every transaction keeps its ENTRY reference (`Ntry/AcctSvcrRef`, the
+ *     key to the camt.053 collective credit — ADR-061 decision 12) and the
+ *     file is archived unaltered ({@see BankMessageArchive}) in the same
+ *     unit of work; after the commit each entry whose reference stands on
+ *     a free camt.053 credit with the same sum and count is linked to it
+ *     ({@see BankEntryLinkService}, ADR-061 stage C3b — nothing booked);
+ *   - **match** — a QRR reference names the debtor and the document:
+ *     positions 11–16 the customer number, 17–26 the document number
+ *     (`QrReferenceLayout`, the wdv-630 layout); the invoice must exist, be
+ *     FINAL, and belong to the debtor with that customer number — else the
+ *     transaction stays `unmatched` with the reason. A NON / SCOR credit is
+ *     matched by the document named in the message — «{label} {number}»,
+ *     the text the payment part prints, for every PAYABLE kind («Rechnung
+ *     n», «Gebühr n»; the labels come from `InvoiceKind`, a credit note is
+ *     not paid) — the office confirms by booking;
+ *   - **assign / ignore** — the office names the invoice for an unmatched
+ *     credit (by document number, final invoices only), or sets a credit
+ *     aside with a note; a booked transaction is never touched again (its
+ *     payment is corrected instead);
+ *   - **book** — every `matched` transaction of a message, in file order,
+ *     becomes a payment on its invoice dated on the value date, on the
+ *     message's payment target, `source_type` `camt` with
+ *     `camt:{message id}:{tx ref}` as the reference: several credits for
+ *     ONE invoice in one file are placed one after the other (the second
+ *     sees the open amount the first left — what wdv missed); a credit
+ *     ABOVE the open amount books the open amount and keeps the rest as
+ *     the transaction's REMAINDER (an overpayment the office settles by
+ *     hand — a refund, a transfer to another invoice); a credit on an
+ *     invoice already settled books nothing and goes back to `unmatched`
+ *     with the reason. One unit of work: a refusal of the ledger (period
+ *     closed) rolls the whole booking back.
+ *
+ * Lock order (debtor.md «Lock order», review 2026-10-13 H4): the MESSAGE
+ * row first (book, assign and ignore all take it — a double «Verbuchen»
+ * waits and then finds nothing left to book), then — booking only — every
+ * invoice row the booking may touch (the matched invoices and the open fee
+ * documents of their debtors), EXCLUSIVE, by id; THEN the transactions are
+ * re-read and the open amounts read; THEN the payments are recorded and
+ * posted (`journal-entry.*`). Nothing is read inside the unit of work
+ * before the last lock: under REPEATABLE READ the first plain read fixes
+ * what the unit of work sees.
+ *
+ * Open work: `matched` and `unmatched` transactions dated in a fiscal year
+ * BLOCK its close (`Close/UnbookedTransactionsCheck`, plan §5.3).
+ */
+final class BankImportService
+{
+    private readonly string $actor;
+
+    /**
+     * @param string|null $actor    who acts; null = the logged-in backend user
+     * @param string|null $basePath the installation root for the camt.054 archive; null = `ABS_BASE_PATH`
+     */
+    public function __construct(private readonly UnifiedEntityManager $em, ?string $actor = null, private readonly ?string $basePath = null)
+    {
+        $this->actor = $actor === null ? Actor::current() : Actor::normalize($actor);
+    }
+
+    /**
+     * Reads a camt.054 file, stores the message with every transaction — each with the bank's ENTRY
+     * reference (`Ntry/AcctSvcrRef`, ADR-061 decision 12) — and archives the file unaltered
+     * ({@see BankMessageArchive}) inside the same unit of work: the message row only commits
+     * together with its file, and a rollback removes the file again.
+     *
+     * @throws BankImportRefusedException NOT_XML | NOT_CAMT054 | DUPLICATE_MESSAGE | TARGET_UNKNOWN | ARCHIVE
+     */
+    public function import(string $xml, string $fileName): BankMessage
+    {
+        $file = CamtReader::read($xml);
+        $existing = $this->messages()->findByMessageId($file->messageId);
+        if ($existing !== null) {
+            throw new BankImportRefusedException(
+                BankImportRefusedException::DUPLICATE_MESSAGE,
+                'Die Meldung «' . $file->messageId . '» wurde bereits am ' . $existing->getImportedAt()->format('d.m.Y H:i') . ' importiert (' . $existing->getFileName() . ').'
+            );
+        }
+        $target  = $this->targetFor($file->iban);
+        $now     = new \DateTimeImmutable();
+        $sha256  = hash('sha256', $xml);
+        $archive = new BankMessageArchive($this->basePath);
+
+        try {
+            $imported = $this->em->getTransaction(BankMessage::class)->run(function () use ($file, $target, $fileName, $now, $xml, $sha256, $archive): BankMessage {
+                try {
+                    $path = $archive->store($xml, $sha256, $file->createdOn, $target->getCode());
+                } catch (\RuntimeException $e) {
+                    error_log('debtor bank import: ' . $e->getMessage());
+                    throw new BankImportRefusedException(BankImportRefusedException::ARCHIVE, 'Nichts importiert: das Archiv konnte nicht geschrieben werden (' . BankMessageArchive::DIR . '). Die Ursache steht im Fehlerprotokoll.', $e);
+                }
+                $message = new BankMessage($file->messageId, $file->createdOn, $file->iban, $target->getCode(), $fileName, $sha256, $path, $this->actor, $now);
+                $seen    = [];
+                foreach ($file->entries as $i => $entry) {
+                    $txRef = $entry->txRef;
+                    if (isset($seen[$txRef])) {
+                        $txRef .= '#' . ($i + 1);   // the bank listed one reference twice — kept apart, named below
+                    }
+                    $seen[$txRef] = true;
+                    $transaction = new BankTransaction(
+                        $message,
+                        $i + 1,
+                        $txRef,
+                        $entry->entryRef,
+                        $entry->valueDate,
+                        $entry->bookingDate,
+                        Money::fromDecimal($entry->amount, $entry->currency),
+                        $entry->referenceType,
+                        $entry->reference,
+                        $entry->remittance,
+                        $entry->debtorName,
+                        $entry->debtorCity,
+                    );
+                    $message->add($transaction);
+                    $this->classify($transaction, $entry, $txRef !== $entry->txRef);
+                }
+                $this->em->persist($message);
+
+                return $message;
+            });
+        } catch (UniqueConstraintViolationException $e) {
+            if (str_contains($e->getMessage(), BankMessage::UNIQUE_MESSAGE_ID)) {
+                // NO discard: the import that won the race may have found OUR file in place (same bytes, same
+                // path) and committed a row naming it — removing it would delete its booking record. At worst a
+                // file of other bytes under the same message id stays unnamed; that is logged, never deleted.
+                error_log('debtor bank import: message ' . $file->messageId . ' imported concurrently — archive file kept: ' . BankMessageArchive::pathFor($sha256, $file->createdOn, $target->getCode()));
+                throw new BankImportRefusedException(BankImportRefusedException::DUPLICATE_MESSAGE, 'Die Meldung «' . $file->messageId . '» wurde soeben von jemand anderem importiert.', $e);
+            }
+            $archive->discardWritten();
+            throw $e;
+        } catch (\Throwable $e) {
+            $archive->discardWritten();
+            throw $e;
+        }
+
+        return $this->linkToStatement($imported);
+    }
+
+    /**
+     * ADR-061 stage C3b: the entries of the message just committed find their camt.053 collective
+     * credit — when the statement was read BEFORE (the other order is the job `debtor-bank-link`).
+     * AFTER the commit, each link its own unit of work: the import stands whatever the link does.
+     * Quiet — a refusal or a failure leaves the entry unlinked for the job's next pass (a failure
+     * is logged). Answers the message as the current EntityManager holds it (a refused link
+     * replaced the manager).
+     */
+    private function linkToStatement(BankMessage $message): BankMessage
+    {
+        $id = (int) $message->getId();
+        if (!BankEntryLinkService::installed()) {
+            return $message;
+        }
+        try {
+            (new BankEntryLinkService($this->em, $this->actor))->linkEntries($this->transactions()->entryRefsOfMessage($id));
+        } catch (\Throwable $e) {
+            error_log('debtor bank import: message ' . $message->getMessageId() . ' imported, link to the bank statement deferred to the job — ' . $e->getMessage());
+        }
+
+        return $this->messages()->find($id) ?? $message;
+    }
+
+    /**
+     * The office names the invoice (by document number) for a transaction
+     * that is not booked.
+     *
+     * @throws BankImportRefusedException NOT_FOUND | STATE | INVOICE_UNKNOWN | INVOICE_NOT_FINAL
+     */
+    public function assign(int $transactionId, int $documentNumber): BankTransaction
+    {
+        $invoice = $this->invoices()->findPayableByNumber($documentNumber);
+        if ($invoice === null) {
+            throw new BankImportRefusedException(BankImportRefusedException::INVOICE_UNKNOWN, "Rechnung {$documentNumber} gibt es nicht.");
+        }
+        if ($invoice->isVoid()) {
+            // ADR-054 decisions 10, 14: a replaced or deleted document takes no payment — the chain names whom to assign.
+            $end = $this->invoices()->chainEnd($invoice);
+            throw new BankImportRefusedException(BankImportRefusedException::INVOICE_NOT_FINAL, $invoice->getReplacedBy() !== null && !$end->isVoid()
+                ? $invoice->documentName() . ' ist ersetzt durch ' . $end->documentName() . ' — ' . $end->documentName() . ' zuordnen.'
+                : $invoice->documentName() . ' ist ' . $invoice->state()->label() . ' — eine andere Rechnung zuordnen.');
+        }
+        if ($invoice->isInJournal()) {
+            // ADR-054, owner decision 6: an issued invoice is not payable until the journal is posted.
+            throw new BankImportRefusedException(BankImportRefusedException::INVOICE_NOT_FINAL, $invoice->documentName() . ' ist noch nicht verbucht (Faktura-Journal) — erst «Journal verbuchen», dann zuordnen.');
+        }
+        if (!$invoice->isPosted()) {
+            throw new BankImportRefusedException(BankImportRefusedException::INVOICE_NOT_FINAL, $invoice->documentName() . ' ist noch in Fakturierung — erst «Fakturieren …», dann das Faktura-Journal verbuchen.');
+        }
+
+        $messageId = $this->messageIdOf($transactionId);
+
+        return $this->em->getTransaction(BankMessage::class)->run(function () use ($transactionId, $messageId, $invoice): BankTransaction {
+            $this->messages()->lockRow($messageId);   // the FIRST lock — see the class docblock
+            $transaction = $this->openTransaction($transactionId);
+            $transaction->matchTo($invoice, 'Manuell zugeordnet.');
+            $this->em->persist($transaction);
+
+            return $transaction;
+        });
+    }
+
+    /**
+     * Sets a transaction aside ($ignore) or takes it back into the open
+     * work ($ignore false → unmatched).
+     *
+     * @throws BankImportRefusedException NOT_FOUND | STATE
+     */
+    public function ignore(int $transactionId, bool $ignore, ?string $note = null): BankTransaction
+    {
+        $messageId = $this->messageIdOf($transactionId);
+
+        return $this->em->getTransaction(BankMessage::class)->run(function () use ($transactionId, $messageId, $ignore, $note): BankTransaction {
+            $this->messages()->lockRow($messageId);   // the FIRST lock — see the class docblock
+            $transaction = $this->openTransaction($transactionId);
+            $ignore ? $transaction->ignore($note ?? 'Vom Sachbearbeiter ignoriert.') : $transaction->unmatch($note);
+            $this->em->persist($transaction);
+
+            return $transaction;
+        });
+    }
+
+    /**
+     * Books every `matched` transaction of $messageId — a payment each,
+     * all in ONE unit of work. Answers the message afresh.
+     *
+     * @throws BankImportRefusedException NOT_FOUND | NOTHING_TO_BOOK
+     * @throws \Z77\Module\Debtor\Accounting\AccountingRefusedException the ledger refused — nothing booked
+     * @throws PaymentRefusedException a settlement rule refused (a target without account …) — nothing booked
+     */
+    public function book(int $messageId): BankMessage
+    {
+        $message = $this->messages()->find($messageId);
+        if ($message === null) {
+            throw new BankImportRefusedException(BankImportRefusedException::NOT_FOUND, "Meldung {$messageId} gibt es nicht.");
+        }
+        // The lock set, read BEFORE the unit of work: the invoices of the matched transactions and the final fee
+        // documents of their debtors (a credit above the invoice goes to them). Judged again under the locks.
+        $lockSet = [];
+        $feesOf  = [];
+        foreach ($this->transactions()->freshOfMessage($messageId) as $transaction) {
+            $invoice = $transaction->getInvoice();
+            if ($transaction->state() !== TransactionState::Matched || $invoice === null) {
+                continue;
+            }
+            $lockSet[] = (int) $invoice->getId();
+            $contactId = (int) $invoice->getContact()->getId();
+            $feesOf[$contactId] ??= array_map(static fn(Invoice $fee) => (int) $fee->getId(), $this->invoices()->finalOfKindFor($contactId, InvoiceKind::Fee));
+            array_push($lockSet, ...$feesOf[$contactId]);
+        }
+        if ($lockSet === []) {
+            throw new BankImportRefusedException(BankImportRefusedException::NOTHING_TO_BOOK, 'Nichts zu verbuchen — keine zugeordnete Transaktion in dieser Meldung.');
+        }
+        $payments  = new PaymentService($this->em, $this->actor);
+        $invoicing = new InvoicingService($this->em, $this->actor);
+
+        return $this->em->getTransaction(BankMessage::class)->run(function () use ($messageId, $message, $lockSet, $payments, $invoicing): BankMessage {
+            // 1. The message row — a second «Verbuchen» of the same message waits here.
+            if (!$this->messages()->lockRow($messageId)) {
+                throw new BankImportRefusedException(BankImportRefusedException::NOT_FOUND, "Meldung {$messageId} gibt es nicht.");
+            }
+            // 2. Every invoice row the booking may touch, EXCLUSIVE, by id — locking reads only, nothing read yet.
+            $locked = array_flip($this->invoices()->lockIds($lockSet));
+
+            // 3. Now read: the transactions as committed (a booking that ran first left none matched); the open
+            //    amounts below — every writer of a payment on these documents held their rows, so a read after the
+            //    locks sees it, and the second credit on one invoice sees what the first left (own writes).
+            $matched = array_values(array_filter($this->transactions()->freshOfMessage($messageId), static fn(BankTransaction $t) => $t->state() === TransactionState::Matched));
+            if ($matched === []) {
+                throw new BankImportRefusedException(BankImportRefusedException::NOTHING_TO_BOOK, 'Nichts zu verbuchen — keine zugeordnete Transaktion in dieser Meldung (inzwischen verbucht?).');
+            }
+            foreach ($matched as $transaction) {
+                if (!isset($locked[(int) $transaction->getInvoice()?->getId()])) {
+                    throw new BankImportRefusedException(BankImportRefusedException::STATE, 'Die Meldung wurde inzwischen geändert — Seite neu laden und nochmals verbuchen.');
+                }
+            }
+
+            // 4. Book, in file order — the payments and their postings (journal-entry.*).
+            foreach ($matched as $transaction) {
+                $invoice = $transaction->getInvoice();
+                $open    = $invoicing->openAmount($invoice);
+                $credit  = $transaction->getAmount();
+                if (!$open->isPositive()) {
+                    $transaction->unmatch($invoice->documentName() . ' ist bereits beglichen — nichts gebucht, Betrag ' . $credit->toDecimal() . ' manuell behandeln.');
+                    $this->em->persist($transaction);
+                    continue;
+                }
+                if ($transaction->getValueDate() < $invoice->getInvoiceDate()) {
+                    $transaction->unmatch('Valuta ' . $transaction->getValueDate()->format('d.m.Y') . ' liegt vor dem Rechnungsdatum von ' . $invoice->documentName() . ' — nicht gebucht.');
+                    $this->em->persist($transaction);
+                    continue;
+                }
+                $placed    = $credit->greaterThan($open) ? $open : $credit;
+                $remainder = $credit->subtract($placed);
+                $payment   = $payments->record(new PaymentDraft(
+                    (int) $invoice->getId(),
+                    $transaction->getValueDate(),
+                    $placed,
+                    Money::zero($credit->currency),
+                    Money::zero($credit->currency),
+                    $message->getPaymentTargetCode(),
+                    mb_substr('CAMT ' . $message->getMessageId() . ($transaction->getDebtorName() !== '' ? ' · ' . $transaction->getDebtorName() : ''), 0, 140),
+                    '',
+                    'camt',
+                    'camt:' . $message->getMessageId() . ':' . $transaction->getTxRef(),
+                ));
+                // What exceeds the invoice goes to the debtor's open FEE documents first (a dunning fee paid with the
+                // invoice under the invoice's reference, P4 part 3) — this invoice's own fees before any other, each
+                // group oldest first; what is left after that is the remainder. Only fees locked in step 2: one booked
+                // since the lock set was read is left alone (the remainder names the amount).
+                $ownRef = $invoice->getNumber() . ':';
+                $fees   = array_values(array_filter(
+                    $this->invoices()->finalOfKindFor((int) $invoice->getContact()->getId(), InvoiceKind::Fee),
+                    static fn(Invoice $fee) => isset($locked[(int) $fee->getId()])
+                ));
+                usort($fees, static fn(Invoice $a, Invoice $b) => [!str_starts_with((string) $a->getSourceRef(), $ownRef), $a->getNumber()] <=> [!str_starts_with((string) $b->getSourceRef(), $ownRef), $b->getNumber()]);
+                $onFees = [];
+                foreach ($fees as $fee) {
+                    if (!$remainder->isPositive()) {
+                        break;
+                    }
+                    $feeOpen = $invoicing->openAmount($fee);
+                    if (!$feeOpen->isPositive() || $transaction->getValueDate() < $fee->getInvoiceDate()) {
+                        continue;
+                    }
+                    $onFee = $remainder->greaterThan($feeOpen) ? $feeOpen : $remainder;
+                    $payments->record(new PaymentDraft(
+                        (int) $fee->getId(),
+                        $transaction->getValueDate(),
+                        $onFee,
+                        Money::zero($credit->currency),
+                        Money::zero($credit->currency),
+                        $message->getPaymentTargetCode(),
+                        mb_substr('CAMT ' . $message->getMessageId() . ' · mit ' . $invoice->documentName(), 0, 140),
+                        '',
+                        'camt',
+                        'camt:' . $message->getMessageId() . ':' . $transaction->getTxRef() . ':' . $fee->getNumber(),
+                    ));
+                    $onFees[]  = $fee->documentName() . ' ' . $onFee->toDecimal();
+                    $remainder = $remainder->subtract($onFee);
+                }
+                $note = $onFees !== [] ? 'Mit der Rechnung bezahlt: ' . implode(', ', $onFees) . '.' : '';
+                if ($remainder->isPositive()) {
+                    $note .= ($note !== '' ? ' ' : '') . 'Überzahlung: ' . $remainder->toDecimal() . ' über dem offenen Betrag — manuell behandeln (Rückzahlung oder andere Rechnung).';
+                }
+                $transaction->booked($payment, $remainder, $note !== '' ? $note : null);
+                $this->em->persist($transaction);
+            }
+
+            return $message;
+        });
+    }
+
+    public function find(int $messageId): ?BankMessage
+    {
+        return $this->messages()->find($messageId);
+    }
+
+    /**
+     * Newest import first. `$done`: `false` the messages with open work, `true` the done ones,
+     * `null` all ({@see BankMessageRepository::newestFirst()}).
+     *
+     * @return list<BankMessage>
+     */
+    public function recent(int $limit = 50, ?bool $done = null): array
+    {
+        return $this->messages()->newestFirst($limit, $done);
+    }
+
+    // ── matching ────────────────────────────────────────────────────────
+
+    /** Sets the first state of a freshly read transaction: ignored with a reason, matched, or unmatched with a reason. */
+    private function classify(BankTransaction $transaction, CamtEntry $entry, bool $duplicateRef): void
+    {
+        if (!$entry->isCredit) {
+            $transaction->ignore('Belastung (DBIT) — kein Zahlungseingang.');
+
+            return;
+        }
+        if ($entry->isReversal) {
+            $transaction->ignore('Rückbuchung (RvslInd) — kein Zahlungseingang.');
+
+            return;
+        }
+        if (!$transaction->getAmount()->isPositive()) {
+            $transaction->ignore('Betrag 0.00 — nichts zu verbuchen.');
+
+            return;
+        }
+        if ($duplicateRef) {
+            $transaction->unmatch('Die Bank führt diese Transaktionsreferenz zweimal in der Meldung — prüfen, bevor sie zugeordnet wird.');
+
+            return;
+        }
+        if ($transaction->getReferenceType() === BankTransaction::REFERENCE_QRR) {
+            $this->matchByQrReference($transaction);
+
+            return;
+        }
+        $this->matchByMessage($transaction);
+    }
+
+    private function matchByQrReference(BankTransaction $transaction): void
+    {
+        $reference = $transaction->getReference();
+        if (!QrReference::isValid($reference)) {
+            $transaction->unmatch('QR-Referenz ' . $reference . ' ist ungültig (Prüfziffer) — manuell zuordnen.');
+
+            return;
+        }
+        $customer = (int) substr($reference, QrReferenceLayout::BANK_DIGITS, QrReferenceLayout::CUSTOMER_DIGITS);
+        $number   = (int) substr($reference, QrReferenceLayout::BANK_DIGITS + QrReferenceLayout::CUSTOMER_DIGITS, QrReferenceLayout::DOCUMENT_DIGITS);
+        $invoice  = $this->invoices()->findPayableByNumber($number);
+        if ($invoice === null) {
+            $transaction->unmatch("QR-Referenz nennt Rechnung {$number}, die es nicht gibt — manuell zuordnen.");
+
+            return;
+        }
+        /** @var DebtorProfileRepository $profiles */
+        $profiles = $this->em->getRepository(DebtorProfile::class);
+        $profile  = $profiles->findByContact($invoice->getContact());
+        if ($profile === null || $profile->getCustomerNumber() !== $customer) {
+            $transaction->unmatch("QR-Referenz nennt Kundennummer {$customer}, Rechnung {$number} gehört aber zu " . ($profile?->getCustomerNumber() ?? '?') . ' — manuell zuordnen.');
+
+            return;
+        }
+        if ($invoice->isVoid()) {
+            $this->routeVoid($transaction, $invoice);
+
+            return;
+        }
+        if ($invoice->isInJournal()) {
+            // ADR-054, owner decision 6: not booked by the import — it waits in the manual payments.
+            $transaction->unmatch('Rechnung noch nicht verbucht — ' . $invoice->documentName() . ' steht im Faktura-Journal; nach «Journal verbuchen» zuordnen.');
+
+            return;
+        }
+        if (!$invoice->isPosted()) {
+            $transaction->unmatch($invoice->documentName() . ' ist noch in Fakturierung — erst «Fakturieren …» und das Faktura-Journal verbuchen, dann zuordnen.');
+
+            return;
+        }
+        $transaction->matchTo($invoice);
+    }
+
+    /**
+     * NON / SCOR: the document named in the message, «{label} {number}» as
+     * the payment part prints it (`Invoice::documentName()`), for every
+     * PAYABLE kind — the labels from `InvoiceKind`, never hard-coded, so a
+     * new payable kind is recognised the day it exists (review 2026-10-13:
+     * «Gebühr n» was not). The number is unique across kinds; the label
+     * only finds it in the text.
+     */
+    private function matchByMessage(BankTransaction $transaction): void
+    {
+        $labels = [];
+        foreach (InvoiceKind::cases() as $kind) {
+            if ($kind->isPayable()) {
+                $labels[] = preg_quote($kind->label(), '/');
+            }
+        }
+        if (!preg_match('/(' . implode('|', $labels) . ')\s*(\d{1,10})\b/iu', $transaction->getRemittance(), $m)) {
+            $transaction->unmatch('Keine QR-Referenz und keine Belegnummer in der Mitteilung — manuell zuordnen.');
+
+            return;
+        }
+        $named   = $m[1] . ' ' . $m[2];
+        $number  = (int) $m[2];
+        $invoice = $this->invoices()->findPayableByNumber($number);
+        if ($invoice === null) {
+            $transaction->unmatch("Die Mitteilung nennt {$named}, die es nicht gibt — manuell zuordnen.");
+
+            return;
+        }
+        if ($invoice->isVoid()) {
+            $this->routeVoid($transaction, $invoice);
+
+            return;
+        }
+        if ($invoice->isInJournal()) {
+            // ADR-054, owner decision 6: not booked by the import — it waits in the manual payments.
+            $transaction->unmatch('Rechnung noch nicht verbucht — ' . $invoice->documentName() . ' steht im Faktura-Journal; nach «Journal verbuchen» zuordnen.');
+
+            return;
+        }
+        if (!$invoice->isPosted()) {
+            $transaction->unmatch($invoice->documentName() . ' ist noch in Fakturierung — erst «Fakturieren …» und das Faktura-Journal verbuchen, dann zuordnen.');
+
+            return;
+        }
+        $transaction->matchTo($invoice, 'Zugeordnet nach der Mitteilung («' . $named . '») — vor dem Verbuchen prüfen.');
+    }
+
+    /**
+     * A reference (QRR or a message's «Rechnung n») that names a VOID document (ADR-054 decision 16, owner
+     * rule 13) is never booked automatically: a REPLACED one leaves the transaction `unmatched` with the END
+     * of the replacement chain A → B → C pre-selected (`suggested_invoice_id`) and the note «Referenz von
+     * Rechnung A — ersetzt durch Rechnung C»; one click («Zuordnen zu …») confirms — once C is posted (an
+     * issued successor waits for «Journal verbuchen», O6, and the note says so). A DELETED one (or a chain
+     * that ends in a deleted one): `unmatched` with «Rechnung A gelöscht».
+     */
+    private function routeVoid(BankTransaction $transaction, Invoice $invoice): void
+    {
+        $end = $this->invoices()->chainEnd($invoice);
+        if ($invoice->getReplacedBy() === null || $end->isVoid()) {
+            $transaction->unmatch($invoice->documentName() . ($invoice->getReplacedBy() !== null ? ' ist ersetzt durch ' . $end->documentName() . ', diese ist ' . $end->state()->label() : ' ist gelöscht') . ' — manuell zuordnen.');
+
+            return;
+        }
+        $transaction->suggest($end, 'Referenz von ' . $invoice->documentName() . ' — ersetzt durch ' . $end->documentName()
+            . ($end->isInJournal() ? ' (noch nicht verbucht — nach «Journal verbuchen» mit «Zuordnen zu …» bestätigen)' : ' — «Zuordnen zu …» bestätigt.'));
+    }
+
+    // ── helpers ─────────────────────────────────────────────────────────
+
+    /** @throws BankImportRefusedException TARGET_UNKNOWN */
+    private function targetFor(string $iban): PaymentTarget
+    {
+        /** @var PaymentTargetRepository $targets */
+        $targets = $this->em->getRepository(PaymentTarget::class);
+        foreach ($targets->allInOrder() as $target) {
+            if ($target->isActive() && in_array($iban, [Iban::normalize($target->getIban()), Iban::normalize($target->getQrIban())], true) && $iban !== '') {
+                return $target;
+            }
+        }
+        throw new BankImportRefusedException(
+            BankImportRefusedException::TARGET_UNKNOWN,
+            'Das Konto ' . ($iban !== '' ? Iban::format($iban) : '(ohne IBAN)') . ' der Meldung ist kein aktives Zahlungsziel — zuerst unter Stammdaten › Auftragswesen › Zahlungsziele anlegen.'
+        );
+    }
+
+    /** @throws BankImportRefusedException NOT_FOUND | STATE */
+    private function openTransaction(int $transactionId): BankTransaction
+    {
+        $transaction = $this->transactions()->fresh($transactionId);   // after the message lock: as committed
+        if ($transaction === null) {
+            throw new BankImportRefusedException(BankImportRefusedException::NOT_FOUND, "Transaktion {$transactionId} gibt es nicht.");
+        }
+        if ($transaction->state() === TransactionState::Booked) {
+            throw new BankImportRefusedException(BankImportRefusedException::STATE, 'Die Transaktion ist verbucht — die Zahlung auf der Rechnung ändern oder löschen.');
+        }
+
+        return $transaction;
+    }
+
+    /**
+     * The message a transaction belongs to — read before the unit of work,
+     * whose FIRST lock is that message's row. It never changes.
+     *
+     * @throws BankImportRefusedException NOT_FOUND
+     */
+    private function messageIdOf(int $transactionId): int
+    {
+        $transaction = $this->em->getRepository(BankTransaction::class)->find($transactionId);
+        if ($transaction === null) {
+            throw new BankImportRefusedException(BankImportRefusedException::NOT_FOUND, "Transaktion {$transactionId} gibt es nicht.");
+        }
+
+        return (int) $transaction->getMessage()->getId();
+    }
+
+    private function transactions(): BankTransactionRepository
+    {
+        return $this->em->getRepository(BankTransaction::class);
+    }
+
+    private function messages(): BankMessageRepository
+    {
+        return $this->em->getRepository(BankMessage::class);
+    }
+
+    private function invoices(): InvoiceRepository
+    {
+        return $this->em->getRepository(Invoice::class);
+    }
+}

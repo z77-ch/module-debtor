@@ -1,0 +1,832 @@
+<?php
+
+namespace Z77\Module\Debtor\Repositories;
+
+use Doctrine\DBAL\ArrayParameterType;
+use Doctrine\DBAL\LockMode;
+use Doctrine\DBAL\ParameterType;
+use Z77\Module\Debtor\Entities\Invoice;
+use Z77\Module\Debtor\Entities\InvoiceKind;
+use Z77\Module\Debtor\Entities\InvoiceState;
+use Z77\Persistence\Doctrine\Repository\DoctrineRepository;
+use Z77\Shared\Money\Money;
+
+/**
+ * Convention repository for {@see Invoice}. Doctrine-only seams (ADR-039
+ * decision 8), each documented: the fetch-joined read of one document with
+ * its lines, the locking re-read a write path needs, the SQL aggregates, and
+ * — since P3 part 3 — the lookups of the document screens (by number, the
+ * list per view with its search, the credit notes of an invoice).
+ *
+ * The receivables aggregates (open amount, settlement figures, open items, the due list, the
+ * fees an overpayment lands on) read POSTED documents only — `state = final`, invoices and
+ * credit notes alike: an issued document in the Faktura-Journal has no debtor ledger entry yet
+ * and cannot be paid (ADR-054, owner decision 6 of 2026-10-23).
+ */
+class InvoiceRepository extends DoctrineRepository
+{
+    /**
+     * How many documents — every kind (invoice, credit note, fee), every state, drafts
+     * included — are written to the contact: what decides whether its debtor profile may
+     * still be DELETED (owner 2026-10-12, «Debitor» off in the contact editor). Payments
+     * (their allocations) and dunning notices hang on documents, so «none» here means none
+     * of them either.
+     *
+     * $lock (inside an open unit of work only): a LOCKING read (`FOR UPDATE`) — it sees rows
+     * committed after the unit of work began, and InnoDB's next-key lock on the `contact_id`
+     * index holds back the insert of a FIRST document for this contact until the caller
+     * commits (REPEATABLE READ, MariaDB's default). Doctrine-only (SQL).
+     *
+     * @throws \LogicException $lock outside an open unit of work
+     */
+    public function countForContact(int $contactId, bool $lock = false): int
+    {
+        if (!$lock) {
+            return (int) $this->connection()->fetchOne('SELECT COUNT(*) FROM invoice WHERE contact_id = ?', [$contactId]);
+        }
+        if (!$this->connection()->isTransactionActive()) {
+            throw new \LogicException('countForContact(lock: true) needs an open unit of work — the lock holds until commit');
+        }
+
+        return count($this->connection()->fetchFirstColumn('SELECT id FROM invoice WHERE contact_id = ? FOR UPDATE', [$contactId]));
+    }
+
+    /**
+     * The document with its lines in ONE query (fetch-join). The tax rows
+     * load lazily on first access — a handful per document. Doctrine-only (DQL).
+     */
+    public function withLines(int $id): ?Invoice
+    {
+        return $this->em()->createQueryBuilder()
+            ->select('i', 'l')
+            ->from(Invoice::class, 'i')
+            ->leftJoin('i.lines', 'l')
+            ->where('i.id = :id')
+            ->setParameter('id', $id)
+            ->getQuery()
+            ->getOneOrNullResult();
+    }
+
+    /**
+     * The document re-read under an EXCLUSIVE row lock (`SELECT … FOR
+     * UPDATE`), held until the caller's commit — what a re-issue and a
+     * finalize do before touching it, so two writers serialise and each
+     * sees the committed state of the other. Inside an open unit of work
+     * only (the `JournalEntryRepository::lockForUpdate()` model).
+     * Doctrine-only.
+     *
+     * @throws \LogicException outside an open unit of work
+     */
+    public function lockForUpdate(int $id): ?Invoice
+    {
+        if (!$this->connection()->isTransactionActive()) {
+            throw new \LogicException('lockForUpdate() needs an open unit of work — the row lock holds until commit');
+        }
+        if ($this->em()->find(Invoice::class, $id, LockMode::PESSIMISTIC_WRITE) === null) {
+            return null;
+        }
+
+        return $this->withLines($id);
+    }
+
+    /**
+     * Locks the rows of $ids EXCLUSIVELY (`SELECT id … FOR UPDATE`), one by
+     * one in ascending id order, WITHOUT reading anything else, and answers
+     * the ids that exist (ascending). What a unit of work over SEVERAL
+     * documents does FIRST (the dunning run, the CAMT booking — review
+     * 2026-10-13 H4): under REPEATABLE READ the read view is taken at the
+     * first non-locking read, so every read after the last of these locks
+     * sees what the writers that held those rows committed (payments,
+     * notices). A locking read takes no read view. Inside an open unit of
+     * work only. Doctrine-only (SQL).
+     *
+     * @param list<int> $ids
+     * @return list<int>
+     * @throws \LogicException outside an open unit of work
+     */
+    public function lockIds(array $ids): array
+    {
+        if (!$this->connection()->isTransactionActive()) {
+            throw new \LogicException('lockIds() needs an open unit of work — the row locks hold until commit');
+        }
+        $ids = array_values(array_unique(array_map('intval', $ids)));
+        sort($ids);
+        $found = [];
+        foreach ($ids as $id) {
+            if ($this->connection()->fetchOne('SELECT id FROM invoice WHERE id = ? FOR UPDATE', [$id]) !== false) {
+                $found[] = $id;
+            }
+        }
+
+        return $found;
+    }
+
+    /**
+     * Σ gross of the FINAL credit notes against $invoice, as a decimal
+     * string («0.00» when none) — the open amount is DERIVED from it
+     * (plan §6.3: never stored in parallel). Doctrine-only (SQL).
+     */
+    public function sumOfFinalCreditNotes(Invoice $invoice): string
+    {
+        if ($invoice->getId() === null) {
+            return '0.00';
+        }
+        $sum = $this->connection()->fetchOne(
+            'SELECT COALESCE(SUM(gross_total), 0.00) FROM invoice WHERE credit_note_of_id = ? AND kind = ? AND state = ?',
+            [$invoice->getId(), InvoiceKind::CreditNote->value, InvoiceState::Final->value]
+        );
+
+        return (string) $sum;
+    }
+
+    /**
+     * The PAYABLE document with $number — an invoice or a fee; every kind
+     * shares one number series, so there is at most one. What a QR
+     * reference (positions 17–26) and a message's «Rechnung n» name.
+     */
+    public function findPayableByNumber(int $number): ?Invoice
+    {
+        return $this->em()->createQueryBuilder()
+            ->select('i')
+            ->from(Invoice::class, 'i')
+            ->where('i.kind <> :credit AND i.number = :number')
+            ->setParameter('credit', InvoiceKind::CreditNote->value)
+            ->setParameter('number', $number)
+            ->getQuery()
+            ->getOneOrNullResult();
+    }
+
+    /**
+     * The open amount of EVERY final invoice (kind invoice) that still has
+     * one, in ONE query: invoice id → decimal string (gross − final credit
+     * notes − allocations). The due list of the dunning (P4 part 3) reads
+     * this, never `openAmount()` per row (DEBTOR-OPEN-001). Doctrine-only
+     * (SQL).
+     *
+     * @return array<int, string>
+     */
+    public function openAmountsOfFinalInvoices(): array
+    {
+        $rows = $this->connection()->fetchAllKeyValue(
+            'SELECT i.id, i.gross_total'
+            . ' - COALESCE((SELECT SUM(c.gross_total) FROM invoice c WHERE c.credit_note_of_id = i.id AND c.kind = ? AND c.state = ?), 0)'
+            . ' - COALESCE((SELECT SUM(a.amount) FROM payment_allocation a WHERE a.invoice_id = i.id), 0) AS open_amount'
+            . ' FROM invoice i WHERE i.kind = ? AND i.state = ?'
+            . ' HAVING open_amount > 0',
+            [InvoiceKind::CreditNote->value, InvoiceState::Final->value, InvoiceKind::Invoice->value, InvoiceState::Final->value]
+        );
+
+        return array_map(static fn($v) => (string) $v, $rows);
+    }
+
+    /**
+     * The settlement figures of the FINAL payable documents (invoice, fee) among $ids in ONE
+     * query — gross, Σ final credit notes against each, Σ allocations of every kind (payment,
+     * discount, loss) — by id; ids that are unknown, a draft or a credit note are left out.
+     * What `Services\PaymentStates` (the read port of a source, plan §7) derives the payment
+     * state from — the aggregates of {@see openItems()}, restricted to a page (DEBTOR-OPEN-001:
+     * never `openAmount()` per row). A plain read, no lock. Doctrine-only (SQL).
+     *
+     * @param list<int> $ids
+     * @return array<int, array{gross: string, credited: string, allocated: string, currency: string}> decimals as strings
+     */
+    public function settlementFiguresOf(array $ids): array
+    {
+        $ids = array_values(array_unique(array_filter(array_map('intval', $ids), static fn(int $id) => $id > 0)));
+        if ($ids === []) {
+            return [];
+        }
+        $rows = $this->connection()->fetchAllAssociative(
+            'SELECT i.id, i.gross_total, i.currency, COALESCE(cn.total, 0) AS credited, COALESCE(pa.total, 0) AS allocated'
+            . ' FROM invoice i'
+            . ' LEFT JOIN (SELECT credit_note_of_id, SUM(gross_total) AS total FROM invoice WHERE kind = ? AND state = ? AND credit_note_of_id IN (?) GROUP BY credit_note_of_id) cn ON cn.credit_note_of_id = i.id'
+            . ' LEFT JOIN (SELECT invoice_id, SUM(amount) AS total FROM payment_allocation WHERE invoice_id IN (?) GROUP BY invoice_id) pa ON pa.invoice_id = i.id'
+            . ' WHERE i.id IN (?) AND i.kind <> ? AND i.state = ?',
+            [InvoiceKind::CreditNote->value, InvoiceState::Final->value, $ids, $ids, $ids, InvoiceKind::CreditNote->value, InvoiceState::Final->value],
+            [ParameterType::STRING, ParameterType::STRING, ArrayParameterType::INTEGER, ArrayParameterType::INTEGER, ArrayParameterType::INTEGER, ParameterType::STRING, ParameterType::STRING]
+        );
+        $figures = [];
+        foreach ($rows as $r) {
+            $figures[(int) $r['id']] = ['gross' => (string) $r['gross_total'], 'credited' => (string) $r['credited'], 'allocated' => (string) $r['allocated'], 'currency' => (string) $r['currency']];
+        }
+
+        return $figures;
+    }
+
+    /**
+     * The MONEY that came for a document, per document: the allocations of kind `payment`
+     * ({@see \Z77\Module\Debtor\Entities\AllocationKind::Payment} — a discount, a loss and a credit
+     * note are no payment) with the date of the last payment, their count, their sum, and the
+     * payment target of the last one / how many different targets. The `kind` literal is a
+     * constant, no input. Joined into {@see OPEN_ITEM_SQL} and read per page by
+     * {@see paymentFactsOf()} — ONE definition (Rule 2). `GROUP_CONCAT … ORDER BY` + `SUBSTRING_INDEX`
+     * pick the last payment's target (MariaDB / MySQL — this repository is Doctrine-only SQL).
+     */
+    private const PAYMENT_FACTS_SQL =
+        'SELECT a.invoice_id, MAX(p.payment_date) AS paid_on, COUNT(DISTINCT p.id) AS payments, SUM(a.amount) AS paid,'
+        . " COUNT(DISTINCT p.payment_target_code) AS targets,"
+        . " SUBSTRING_INDEX(GROUP_CONCAT(p.payment_target_code ORDER BY p.payment_date DESC, p.id DESC SEPARATOR '|'), '|', 1) AS target"
+        . ' FROM payment_allocation a JOIN payment p ON p.id = a.payment_id'
+        . " WHERE a.kind = 'payment'";
+
+    /**
+     * When, how much and through which payment target the documents of a page were paid, and the
+     * FINAL credit notes issued against them (owner 2026-11-19, the list «Rechnungen») — two reads
+     * per page, no lock. A document nothing came for and nothing was credited to is left out.
+     * Doctrine-only (SQL).
+     *
+     * @param list<int> $ids
+     * @return array<int, PaymentFacts> by document id
+     */
+    public function paymentFactsOf(array $ids): array
+    {
+        $ids = array_values(array_unique(array_filter(array_map('intval', $ids), static fn(int $id) => $id > 0)));
+        if ($ids === []) {
+            return [];
+        }
+        $paid = [];
+        foreach ($this->connection()->fetchAllAssociative(
+            'SELECT f.*, i.currency FROM (' . self::PAYMENT_FACTS_SQL . ' AND a.invoice_id IN (?) GROUP BY a.invoice_id) f JOIN invoice i ON i.id = f.invoice_id',
+            [$ids],
+            [ArrayParameterType::INTEGER]
+        ) as $r) {
+            $paid[(int) $r['invoice_id']] = $r;
+        }
+        $credited = [];
+        foreach ($this->connection()->fetchAllAssociative(
+            'SELECT credit_note_of_id, number FROM invoice WHERE kind = ? AND state = ? AND credit_note_of_id IN (?) AND number IS NOT NULL ORDER BY number',
+            [InvoiceKind::CreditNote->value, InvoiceState::Final->value, $ids],
+            [ParameterType::STRING, ParameterType::STRING, ArrayParameterType::INTEGER]
+        ) as $r) {
+            $credited[(int) $r['credit_note_of_id']][] = (int) $r['number'];
+        }
+        $facts = [];
+        foreach (array_unique(array_merge(array_keys($paid), array_keys($credited))) as $id) {
+            $r          = $paid[$id] ?? null;
+            $facts[$id] = new PaymentFacts(
+                $r !== null ? new \DateTimeImmutable((string) $r['paid_on']) : null,
+                (int) ($r['payments'] ?? 0),
+                $r !== null ? Money::fromDecimal((string) $r['paid'], (string) $r['currency']) : null,
+                (string) ($r['target'] ?? ''),
+                (int) ($r['targets'] ?? 0),
+                $credited[$id] ?? [],
+            );
+        }
+
+        return $facts;
+    }
+
+    /**
+     * The FINAL documents of $kind of one party, oldest first — the fees
+     * an overpayment is placed on (P4 part 2/3), the invoices a due list
+     * walks. Doctrine-only (DQL).
+     *
+     * @return list<Invoice>
+     */
+    public function finalOfKindFor(int $contactId, InvoiceKind $kind): array
+    {
+        return $this->em()->createQueryBuilder()
+            ->select('i')
+            ->from(Invoice::class, 'i')
+            ->where('i.contact = :contact AND i.kind = :kind AND i.state = :final')
+            ->setParameter('contact', $contactId)
+            ->setParameter('kind', $kind->value)
+            ->setParameter('final', InvoiceState::Final->value)
+            ->orderBy('i.number', 'ASC')
+            ->getQuery()
+            ->getResult();
+    }
+
+    /**
+     * One page of the document list (P3 part 3): the documents of the view
+     * matching every criterion of $search, in its order. The search runs in
+     * the database — never a filter of the rows on screen. Every value is
+     * bound; the ORDER BY comes from a fixed map, never from input.
+     * Doctrine-only (SQL + DQL).
+     *
+     * @return list<Invoice>
+     */
+    public function search(InvoiceSearch $search, int $offset, int $limit): array
+    {
+        [$where, $params, $types] = $this->searchWhere($search);
+        $dir   = $search->descending ? 'DESC' : 'ASC';
+        // A draft has no number (owner 2026-10-10): by number, the drafts come first when descending (they are
+        // the newest) and last when ascending; the id breaks every tie — drafts among themselves by creation.
+        $byNumber = "number IS NULL {$dir}, number {$dir}, id {$dir}";
+        $order = match ($search->sort) {
+            'date'   => "invoice_date {$dir}, {$byNumber}",
+            'name'   => "addr_name {$dir}, addr_first_name {$dir}, {$byNumber}",
+            'amount' => "gross_total {$dir}, {$byNumber}",
+            default  => $byNumber,
+        };
+        $ids = $this->connection()->fetchFirstColumn(
+            "SELECT id FROM invoice{$where} ORDER BY {$order} LIMIT ? OFFSET ?",
+            array_merge($params, [max(1, $limit), max(0, $offset)]),
+            array_merge($types, [ParameterType::INTEGER, ParameterType::INTEGER])
+        );
+        if ($ids === []) {
+            return [];
+        }
+        $byId = [];
+        foreach ($this->em()->createQueryBuilder()->select('i')->from(Invoice::class, 'i')->where('i.id IN (:ids)')->setParameter('ids', array_map('intval', $ids))->getQuery()->getResult() as $invoice) {
+            $byId[$invoice->getId()] = $invoice;
+        }
+
+        return array_values(array_filter(array_map(static fn($id) => $byId[(int) $id] ?? null, $ids)));
+    }
+
+    /** How many documents match $search — the list's pager and badge. Doctrine-only (SQL). */
+    public function countSearch(InvoiceSearch $search): int
+    {
+        [$where, $params, $types] = $this->searchWhere($search);
+
+        return (int) $this->connection()->fetchOne("SELECT COUNT(*) FROM invoice{$where}", $params, $types);
+    }
+
+    /**
+     * The invoice dates of the documents $ids, as `Y-m-d` strings by id —
+     * what the booking print reads BEFORE its unit of work to create the
+     * month ranges it will lock (`InvoicingService::finalize()`). Plain SQL
+     * on purpose: no entity enters the identity map, so the locked re-read
+     * inside the unit of work is the one that counts. Unknown ids are left
+     * out. Doctrine-only (SQL).
+     *
+     * @param list<int> $ids
+     * @return array<int, string>
+     */
+    public function invoiceDatesOf(array $ids): array
+    {
+        $ids = array_values(array_unique(array_filter(array_map('intval', $ids), static fn(int $id) => $id > 0)));
+        if ($ids === []) {
+            return [];
+        }
+        $rows = $this->connection()->fetchAllKeyValue('SELECT id, invoice_date FROM invoice WHERE id IN (?)', [$ids], [ArrayParameterType::INTEGER]);
+
+        return array_map(static fn($date) => (string) $date, $rows);
+    }
+
+    /**
+     * The distinct «Betreffname» labels the documents carry (owner 2026-10-21) — suggestions of the
+     * document screens' `<datalist>`, at most $limit, alphabetical. Doctrine-only (DQL).
+     *
+     * @return list<string>
+     */
+    public function subjectLabelsInUse(int $limit): array
+    {
+        return array_map('strval', $this->em()->createQueryBuilder()
+            ->select('DISTINCT i.subjectLabel')
+            ->from(Invoice::class, 'i')
+            ->where('i.subjectLabel IS NOT NULL')
+            ->orderBy('i.subjectLabel', 'ASC')
+            ->setMaxResults($limit)
+            ->getQuery()
+            ->getSingleColumnResult());
+    }
+
+    /**
+     * The document $document REPLACED — the predecessor whose `replaced_by_id` names it (ADR-054 decision
+     * 10); null when it replaced none. What the successor's PDF prints («ersetzt Rechnung … (ID …)»,
+     * decision 23), its mail names and its mask links. A plain read (the replacement flushes the
+     * predecessor before the successor's PDF is rendered). Doctrine-only (DQL).
+     */
+    public function predecessorOf(Invoice $document): ?Invoice
+    {
+        if ($document->getId() === null) {
+            return null;
+        }
+
+        return $this->em()->createQueryBuilder()
+            ->select('i')
+            ->from(Invoice::class, 'i')
+            ->where('i.replacedBy = :doc')
+            ->setParameter('doc', $document->getId())
+            ->setMaxResults(1)
+            ->getQuery()
+            ->getOneOrNullResult();
+    }
+
+    /**
+     * The END of the replacement chain that starts at $document: A → B → C answers C (ADR-054 decision
+     * 16, owner rule 13); a document that is not replaced answers itself. Bounded — a cycle is
+     * impossible by construction (a successor is always a new row) but guarded.
+     */
+    public function chainEnd(Invoice $document): Invoice
+    {
+        $current = $document;
+        $seen    = [];
+        while ($current->getReplacedBy() !== null && !isset($seen[(int) $current->getId()]) && count($seen) < 100) {
+            $seen[(int) $current->getId()] = true;
+            $current = $current->getReplacedBy();
+        }
+
+        return $current;
+    }
+
+    /**
+     * The credit notes issued against $invoice, oldest first — the detail
+     * view lists them. Doctrine-only (DQL).
+     *
+     * @return list<Invoice>
+     */
+    public function creditNotesOf(Invoice $invoice): array
+    {
+        return $this->em()->createQueryBuilder()
+            ->select('i')
+            ->from(Invoice::class, 'i')
+            ->where('i.creditNoteOf = :invoice')
+            ->setParameter('invoice', $invoice)
+            ->orderBy('i.number', 'ASC')
+            ->getQuery()
+            ->getResult();
+    }
+
+    /**
+     * One page of the open-item list (2026-10-07, the wdv-630 «Debitoren»
+     * list): the final payable documents of the view with what settled them
+     * and what is open, and the debtor's customer number and highest dunning
+     * level — ONE query, aggregates joined per document. Doctrine-only (SQL).
+     *
+     * @return list<OpenItem>
+     */
+    public function openItems(OpenItemSearch $search, int $offset, int $limit): array
+    {
+        [$where, $params, $types] = $this->openItemWhere($search);
+        $dir   = $search->descending ? 'DESC' : 'ASC';
+        $order = match ($search->sort) {
+            'number'   => "number {$dir}",
+            'date'     => "invoice_date {$dir}, number {$dir}",
+            'name'     => "addr_name {$dir}, addr_first_name {$dir}, number {$dir}",
+            'customer' => "customer_number {$dir}, number {$dir}",
+            'gross'    => "gross_total {$dir}, number {$dir}",
+            'open'     => "open_amount {$dir}, number {$dir}",
+            // never paid sorts as «no date»: last when the newest payment leads, first when the oldest does
+            'paid'     => "paid_on IS NOT NULL {$dir}, paid_on {$dir}, number {$dir}",
+            default    => "due_date {$dir}, number {$dir}",
+        };
+        $rows = $this->connection()->fetchAllAssociative(
+            'SELECT * FROM (' . self::OPEN_ITEM_SQL . ") t{$where} ORDER BY {$order} LIMIT ? OFFSET ?",
+            array_merge(self::openItemParams(), $params, [max(1, $limit), max(0, $offset)]),
+            array_merge(array_fill(0, count(self::openItemParams()), ParameterType::STRING), $types, [ParameterType::INTEGER, ParameterType::INTEGER])
+        );
+
+        return array_map(static fn(array $r) => new OpenItem(
+            (int) $r['id'],
+            InvoiceKind::from((string) $r['kind']),
+            (int) $r['number'],
+            (int) $r['customer_number'],
+            trim($r['addr_first_name'] . ' ' . $r['addr_name']),
+            new \DateTimeImmutable((string) $r['invoice_date']),
+            new \DateTimeImmutable((string) $r['due_date']),
+            Money::fromDecimal((string) $r['gross_total'], (string) $r['currency']),
+            Money::fromDecimal((string) $r['settled_amount'], (string) $r['currency']),
+            Money::fromDecimal((string) $r['open_amount'], (string) $r['currency']),
+            (int) $r['dunning_level'],
+            new PaymentFacts(
+                $r['paid_on'] !== null ? new \DateTimeImmutable((string) $r['paid_on']) : null,
+                (int) $r['payments'],
+                $r['paid'] !== null ? Money::fromDecimal((string) $r['paid'], (string) $r['currency']) : null,
+                (string) $r['payment_target'],
+                (int) $r['targets'],
+            ),
+        ), $rows);
+    }
+
+    /**
+     * The open-item list's count for $search, and — over ALL open documents,
+     * whatever the view — the open total and the overdue part as of the
+     * search's day: the list header (wdv «OP-Total»). Per currency would be
+     * a second line; the base currency is all P3/P4 issue. Doctrine-only (SQL).
+     *
+     * @return array{count: int, open: string, overdue: string, openCount: int, overdueCount: int} decimals as strings
+     */
+    public function openItemTotals(OpenItemSearch $search): array
+    {
+        [$where, $params, $types] = $this->openItemWhere($search);
+        $base  = self::openItemParams();
+        $count = (int) $this->connection()->fetchOne(
+            'SELECT COUNT(*) FROM (' . self::OPEN_ITEM_SQL . ") t{$where}",
+            array_merge($base, $params),
+            array_merge(array_fill(0, count($base), ParameterType::STRING), $types)
+        );
+        $sums = $this->connection()->fetchAssociative(
+            'SELECT COALESCE(SUM(open_amount), 0) AS open, COUNT(*) AS open_count,'
+            . ' COALESCE(SUM(CASE WHEN due_date < ? THEN open_amount END), 0) AS overdue, SUM(due_date < ?) AS overdue_count'
+            . ' FROM (' . self::OPEN_ITEM_SQL . ') t WHERE open_amount > 0',
+            array_merge([$search->today->format('Y-m-d'), $search->today->format('Y-m-d')], $base)
+        ) ?: [];
+
+        return [
+            'count'        => $count,
+            'open'         => (string) ($sums['open'] ?? '0.00'),
+            'overdue'      => (string) ($sums['overdue'] ?? '0.00'),
+            'openCount'    => (int) ($sums['open_count'] ?? 0),
+            'overdueCount' => (int) ($sums['overdue_count'] ?? 0),
+        ];
+    }
+
+    /**
+     * The open-item rows: every FINAL payable document with its settled
+     * amount (allocations + final credit notes against it), the open rest,
+     * the debtor's customer number and the highest dunning level. Its `?`
+     * are {@see openItemParams()}.
+     */
+    private const OPEN_ITEM_SQL =
+        'SELECT i.id, i.kind, i.number, i.invoice_date, i.due_date, i.gross_total, i.currency, i.addr_name, i.addr_first_name,'
+        . ' COALESCE(d.customer_number, 0) AS customer_number,'
+        . ' COALESCE(pa.total, 0) + COALESCE(cn.total, 0) AS settled_amount,'
+        . ' i.gross_total - COALESCE(pa.total, 0) - COALESCE(cn.total, 0) AS open_amount,'
+        . ' COALESCE(dn.level, 0) AS dunning_level,'
+        . ' pf.paid_on, COALESCE(pf.payments, 0) AS payments, pf.paid, COALESCE(pf.targets, 0) AS targets, COALESCE(pf.target, \'\') AS payment_target'
+        . ' FROM invoice i'
+        . ' LEFT JOIN debtor_profile d ON d.contact_id = i.contact_id'
+        . ' LEFT JOIN (SELECT invoice_id, SUM(amount) AS total FROM payment_allocation GROUP BY invoice_id) pa ON pa.invoice_id = i.id'
+        . ' LEFT JOIN (SELECT credit_note_of_id, SUM(gross_total) AS total FROM invoice WHERE kind = ? AND state = ? GROUP BY credit_note_of_id) cn ON cn.credit_note_of_id = i.id'
+        . ' LEFT JOIN (SELECT invoice_id, MAX(level_number) AS level FROM dunning_notice GROUP BY invoice_id) dn ON dn.invoice_id = i.id'
+        . ' LEFT JOIN (' . self::PAYMENT_FACTS_SQL . ' GROUP BY a.invoice_id) pf ON pf.invoice_id = i.id'
+        . ' WHERE i.kind <> ? AND i.state = ?';
+
+    /** @return list<string> the values of {@see OPEN_ITEM_SQL}'s `?`, in order */
+    private static function openItemParams(): array
+    {
+        return [InvoiceKind::CreditNote->value, InvoiceState::Final->value, InvoiceKind::CreditNote->value, InvoiceState::Final->value];
+    }
+
+    /** @return array{0: string, 1: list<mixed>, 2: list<ParameterType>} the WHERE over the derived table `t` */
+    private function openItemWhere(OpenItemSearch $search): array
+    {
+        $where  = [];
+        $params = [];
+        $types  = [];
+        if ($search->view !== OpenItemSearch::VIEW_ALL) {
+            $where[] = 'open_amount > 0';
+        }
+        if ($search->view === OpenItemSearch::VIEW_OVERDUE) {
+            $where[]  = 'due_date < ?';
+            $params[] = $search->today->format('Y-m-d');
+            $types[]  = ParameterType::STRING;
+        }
+        $add = static function (string $sql, mixed $value, ParameterType $type = ParameterType::STRING) use (&$where, &$params, &$types): void {
+            $where[]  = $sql;
+            $params[] = $value;
+            $types[]  = $type;
+        };
+        if ($search->number !== null) {
+            $add('number = ?', $search->number, ParameterType::INTEGER);
+        }
+        if ($search->customer !== null) {
+            $add('customer_number = ?', $search->customer, ParameterType::INTEGER);
+        }
+        if ($search->name !== null) {
+            $like = '%' . addcslashes($search->name, '\\%_') . '%';
+            $where[]  = "(addr_name LIKE ? OR addr_first_name LIKE ? OR CONCAT(addr_first_name, ' ', addr_name) LIKE ?)";
+            array_push($params, $like, $like, $like);
+            array_push($types, ParameterType::STRING, ParameterType::STRING, ParameterType::STRING);
+        }
+        if ($search->gross !== null) {
+            $add('gross_total = ?', $search->gross);
+        }
+        if ($search->open !== null) {
+            $add('open_amount = ?', $search->open);
+        }
+        if ($search->dateFrom !== null) {
+            $add('invoice_date >= ?', $search->dateFrom);
+        }
+        if ($search->dateTo !== null) {
+            $add('invoice_date <= ?', $search->dateTo);
+        }
+        if ($search->dueFrom !== null) {
+            $add('due_date >= ?', $search->dueFrom);
+        }
+        if ($search->dueTo !== null) {
+            $add('due_date <= ?', $search->dueTo);
+        }
+        if ($search->paidFrom !== null) {
+            $add('paid_on >= ?', $search->paidFrom);
+        }
+        if ($search->paidTo !== null) {
+            $add('paid_on <= ?', $search->paidTo);
+        }
+
+        return [$where === [] ? '' : ' WHERE ' . implode(' AND ', $where), $params, $types];
+    }
+
+    /** @return array{0: string, 1: list<mixed>, 2: list<ParameterType>} */
+    private function searchWhere(InvoiceSearch $search): array
+    {
+        $where  = [];
+        $params = [];
+        $types  = [];
+        $add = static function (string $sql, mixed $value, ParameterType $type = ParameterType::STRING) use (&$where, &$params, &$types): void {
+            $where[]  = $sql;
+            $params[] = $value;
+            $types[]  = $type;
+        };
+        if ($search->view === InvoiceSearch::VIEW_CREDIT) {
+            // Credit notes in every standing state — the void ones have their own tabs (ADR-054 rule 4).
+            $add('kind = ?', InvoiceKind::CreditNote->value);
+            $where[]  = 'state NOT IN (?, ?)';
+            array_push($params, InvoiceState::Replaced->value, InvoiceState::Deleted->value);
+            array_push($types, ParameterType::STRING, ParameterType::STRING);
+        } elseif ($search->view === InvoiceSearch::VIEW_REPLACED || $search->view === InvoiceSearch::VIEW_DELETED) {
+            // «Ersetzt» / «Gelöscht» (ADR-054 rule 4, step 4): every kind in that state — hidden from every other tab.
+            $add('state = ?', $search->view === InvoiceSearch::VIEW_REPLACED ? InvoiceState::Replaced->value : InvoiceState::Deleted->value);
+        } elseif ($search->view === InvoiceSearch::VIEW_JOURNAL) {
+            // The Faktura-Journal (ADR-054 decision 5): every kind in `issued` — credit notes included.
+            $add('state = ?', InvoiceState::Issued->value);
+        } else {
+            // The payable kinds — invoices and fees (P4 part 3) — share the three state views.
+            $add('kind <> ?', InvoiceKind::CreditNote->value);
+            $add('state = ?', match ($search->view) {
+                InvoiceSearch::VIEW_FINAL  => InvoiceState::Final->value,
+                InvoiceSearch::VIEW_ISSUED => InvoiceState::Issued->value,
+                default                    => InvoiceState::Invoicing->value,
+            });
+        }
+        if ($search->number !== null) {
+            $add('number = ?', $search->number, ParameterType::INTEGER);
+        }
+        if ($search->dateFrom !== null) {
+            $add('invoice_date >= ?', $search->dateFrom);
+        }
+        if ($search->dateTo !== null) {
+            $add('invoice_date <= ?', $search->dateTo);
+        }
+        if ($search->name !== null) {
+            $like = '%' . addcslashes($search->name, '\\%_') . '%';
+            $where[]  = "(addr_name LIKE ? OR addr_first_name LIKE ? OR CONCAT(addr_first_name, ' ', addr_name) LIKE ?)";
+            array_push($params, $like, $like, $like);
+            array_push($types, ParameterType::STRING, ParameterType::STRING, ParameterType::STRING);
+        }
+        if ($search->amount !== null) {
+            $add('gross_total = ?', $search->amount);
+        }
+
+        return [' WHERE ' . implode(' AND ', $where), $params, $types];
+    }
+
+    /**
+     * Σ gross of every BOOKED document (`ledger_entry_ref` set) dated on or before $at —
+     * invoices and fee documents positive, credit notes negative —, as a decimal string
+     * ('0.00' when none): what debtor posted onto the receivable account up to that day
+     * (`PostingBuilder`: the receivable takes the gross on the document's date, on the kind's
+     * side). A document that posted nothing (NullAccountingGateway, a zero document) has no
+     * ref and does not count. The first half of `ReceivablesReconciliation`. A plain read, no
+     * lock — it runs in the year close's snapshot. Doctrine-only (SQL).
+     */
+    public function sumBookedUpTo(\DateTimeImmutable $at): string
+    {
+        $sum = $this->connection()->fetchOne(
+            'SELECT COALESCE(SUM(CASE WHEN kind = ? THEN -gross_total ELSE gross_total END), 0.00) FROM invoice'
+            . ' WHERE ledger_entry_ref IS NOT NULL AND invoice_date <= ?',
+            [InvoiceKind::CreditNote->value, $at->format('Y-m-d')]
+        );
+
+        return (string) $sum;
+    }
+
+    /**
+     * The documents NOT POSTED dated from $from to $to, both inclusive — the drafts (`invoicing`)
+     * and, since the Faktura-Journal (ADR-054 decision 17, owner decision O1), the issued ones in
+     * the journal (`issued`): what the year close is blocked by (`InvoicingInProgressCheck`, plan
+     * §5.3) — their posting would land in a closed year. An issued document dated in the NEXT year
+     * is outside the range and does not block. The count of all of them and the first $limit rows
+     * (`id`, `kind`, `state`, `number` — NULL on a draft —, `invoice_date`, `addr_first_name`,
+     * `addr_name`) in date order — by the index `idx_invoice_state_date`. Doctrine-only (SQL).
+     *
+     * @return array{count: int, rows: list<array{id: int|string, kind: string, state: string, number: int|string|null, invoice_date: string, addr_first_name: string, addr_name: string}>}
+     */
+    public function unpostedBetween(\DateTimeImmutable $from, \DateTimeImmutable $to, int $limit): array
+    {
+        $params = [[InvoiceState::Invoicing->value, InvoiceState::Issued->value], $from->format('Y-m-d'), $to->format('Y-m-d')];
+        $types  = [ArrayParameterType::STRING, ParameterType::STRING, ParameterType::STRING];
+        $where  = 'FROM invoice WHERE state IN (?) AND invoice_date BETWEEN ? AND ?';
+        $count  = (int) $this->connection()->fetchOne('SELECT COUNT(*) ' . $where, $params, $types);
+        $rows   = $count === 0 ? [] : $this->connection()->fetchAllAssociative(
+            'SELECT id, kind, state, number, invoice_date, addr_first_name, addr_name ' . $where . ' ORDER BY invoice_date, id LIMIT ?',
+            [...$params, max(1, $limit)],
+            [...$types, ParameterType::INTEGER]
+        );
+
+        return ['count' => $count, 'rows' => $rows];
+    }
+
+    /**
+     * The open Faktura-Journal in figures (ADR-054 step 9): how many documents are `issued`, how many
+     * wait for «Neu fakturieren», and the gross per currency (a credit note negative) — optionally
+     * only those dated $from … $to (a report's range). What the report hint and the dashboard say.
+     *
+     * @return array{count: int, blocked: int, gross: array<string, Money>}
+     */
+    public function journalSummary(?\DateTimeImmutable $from = null, ?\DateTimeImmutable $to = null): array
+    {
+        $where  = 'FROM invoice WHERE state = ?';
+        $params = [InvoiceState::Issued->value];
+        if ($from !== null && $to !== null) {
+            $where   .= ' AND invoice_date BETWEEN ? AND ?';
+            $params[] = $from->format('Y-m-d');
+            $params[] = $to->format('Y-m-d');
+        }
+        $rows = $this->connection()->fetchAllAssociative(
+            'SELECT currency, COUNT(*) AS n, SUM(reissue_needed IS NOT NULL) AS blocked,'
+            . ' SUM(CASE WHEN kind = ? THEN -gross_total ELSE gross_total END) AS gross ' . $where . ' GROUP BY currency',
+            [InvoiceKind::CreditNote->value, ...$params]
+        );
+        $summary = ['count' => 0, 'blocked' => 0, 'gross' => []];
+        foreach ($rows as $r) {
+            $summary['count']   += (int) $r['n'];
+            $summary['blocked'] += (int) $r['blocked'];
+            $summary['gross'][(string) $r['currency']] = Money::fromDecimal((string) $r['gross'], (string) $r['currency']);
+        }
+
+        return $summary;
+    }
+
+    // ── the Faktura-Journal (ADR-054, step 3 of the build plan) ──────────────
+
+    /**
+     * The documents of a journal in NUMBER order with their lines — the open Faktura-Journal (every
+     * kind in `issued`, $postingId null) or the batch one «Journal verbuchen» posted
+     * (`journal_posting_id = $postingId`). What the journal list prints and what the posting reads
+     * (unlocked — the posting locks by id itself). Doctrine-only (DQL).
+     *
+     * @return list<Invoice>
+     */
+    public function journalDocuments(?int $postingId = null): array
+    {
+        $qb = $this->em()->createQueryBuilder()->select('i', 'l')->from(Invoice::class, 'i')->leftJoin('i.lines', 'l');
+        if ($postingId === null) {
+            $qb->where('i.state = :state')->setParameter('state', InvoiceState::Issued->value);
+        } else {
+            $qb->where('IDENTITY(i.journalPosting) = :posting')->setParameter('posting', $postingId);
+        }
+
+        return $qb->orderBy('i.number', 'ASC')->addOrderBy('i.id', 'ASC')->addOrderBy('l.position', 'ASC')->getQuery()->getResult();
+    }
+
+    /**
+     * The ids and versions of the open Faktura-Journal in number order — what the confirmation of
+     * «Journal verbuchen» carries (the versions the user SAW) and the posting compares under its
+     * locks. Doctrine-only (SQL).
+     *
+     * @return list<array{id: int, version: int}>
+     */
+    public function journalVersions(): array
+    {
+        return array_map(
+            static fn(array $r) => ['id' => (int) $r['id'], 'version' => (int) $r['version']],
+            $this->connection()->fetchAllAssociative('SELECT id, version FROM invoice WHERE state = ? ORDER BY number, id', [InvoiceState::Issued->value])
+        );
+    }
+
+    /**
+     * The totals of a journal ({@see journalDocuments()} — open or one posted batch), SIGNED as the
+     * receivable takes them (`InvoiceKind::sign()`: a credit note negative): count, net, VAT,
+     * gross, the oldest and newest invoice date, how many are flagged «Neu fakturieren nötig»
+     * (`reissue_needed`), and one row per VAT code and rate (base, tax) in code order. Decimal
+     * strings ('0.00' when none). Doctrine-only (SQL).
+     *
+     * @return array{count: int, net: string, tax: string, gross: string, oldest: ?string, newest: ?string, blocked: int, vat: list<array{code: string, rate: int, label: string, base: string, tax: string}>}
+     */
+    public function journalTotals(?int $postingId = null): array
+    {
+        [$where, $param] = $postingId === null ? ['i.state = ?', InvoiceState::Issued->value] : ['i.journal_posting_id = ?', $postingId];
+        $sign = 'CASE WHEN i.kind = ? THEN -1 ELSE 1 END';
+        $credit = InvoiceKind::CreditNote->value;
+        $head = $this->connection()->fetchAssociative(
+            "SELECT COUNT(*) AS n, COALESCE(SUM({$sign} * i.net_total), 0) AS net, COALESCE(SUM({$sign} * i.tax_total), 0) AS tax,"
+            . " COALESCE(SUM({$sign} * i.gross_total), 0) AS gross, MIN(i.invoice_date) AS oldest, MAX(i.invoice_date) AS newest,"
+            . " COALESCE(SUM(CASE WHEN i.reissue_needed IS NULL THEN 0 ELSE 1 END), 0) AS blocked FROM invoice i WHERE {$where}",
+            [$credit, $credit, $credit, $param]
+        ) ?: [];
+        $vat = $this->connection()->fetchAllAssociative(
+            "SELECT t.tax_code AS code, t.tax_rate AS rate, MIN(t.tax_label) AS label, SUM({$sign} * t.tax_base) AS base, SUM({$sign} * t.tax_amount) AS tax"
+            . " FROM invoice_tax t JOIN invoice i ON i.id = t.invoice_id WHERE {$where} GROUP BY t.tax_code, t.tax_rate ORDER BY t.tax_code, t.tax_rate",
+            [$credit, $credit, $param]
+        );
+
+        return [
+            'count'   => (int) ($head['n'] ?? 0),
+            'net'     => self::decimal($head['net'] ?? 0),
+            'tax'     => self::decimal($head['tax'] ?? 0),
+            'gross'   => self::decimal($head['gross'] ?? 0),
+            'oldest'  => isset($head['oldest']) ? (string) $head['oldest'] : null,
+            'newest'  => isset($head['newest']) ? (string) $head['newest'] : null,
+            'blocked' => (int) ($head['blocked'] ?? 0),
+            'vat'     => array_map(static fn(array $r) => ['code' => (string) $r['code'], 'rate' => (int) $r['rate'], 'label' => (string) $r['label'], 'base' => self::decimal($r['base']), 'tax' => self::decimal($r['tax'])], $vat),
+        ];
+    }
+
+    /**
+     * A SUM of two-decimal columns as the string «-12.50» — the database answers DECIMAL already; an
+     * integer «0» is padded. String handling only, no float (the module's money rule).
+     */
+    private static function decimal(mixed $value): string
+    {
+        $s = trim((string) $value);
+        if (preg_match('/^(-?)(\d+)(?:\.(\d*))?$/', $s, $m) !== 1) {
+            throw new \UnexpectedValueException("Not a decimal sum: '{$s}'");
+        }
+
+        return $m[1] . $m[2] . '.' . str_pad(substr($m[3] ?? '', 0, 2), 2, '0');
+    }
+}

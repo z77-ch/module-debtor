@@ -1,0 +1,149 @@
+<?php
+/**
+ * The facts of an EXISTING document — the block under the positions of the one mask
+ * (owner 2026-10-21: the read view `detail` is gone, what only it showed stands here,
+ * read-only). From the SNAPSHOT for a final document (`debtor.md`: an issued document is
+ * never resolved again); what the form shows itself (address, subject, dates, terms, lines,
+ * totals) is not repeated.
+ *
+ *   - «Beleg»: the state badge; «Gutschrift zu» (a credit note); «Buchung» — the ledger
+ *     reference linked to the journal entry as a WINDOW (ADR-047, `?ref=`) when the
+ *     bookkeeping is here; «Zahlungen» — the settlements with their «ändern» link (P4 part 1);
+ *     «Offen»; «Mahnungen» — the dunning history with the fee document and its PDF (P4 part 3);
+ *     «Mahngebühr zu» (a fee document); «Gutschriften»; «MWST» — the note a document without
+ *     VAT printed, from the snapshot (owner 2026-10-22; only when one was stored); «E-Mail» — the
+ *     document by e-mail, one line per outbox mail («per E-Mail an … gesendet am …», step 3 of the
+ *     mail plan); «Erstellt»
+ *     with the last change;
+ *   - «Zahlteil (QR-Rechnung)» (not on a credit note): account with its kind, the creditor, the
+ *     reference in blocks of five or «NON» with the message — on a draft «folgt mit der
+ *     Belegnummer beim Buchungsdruck» — and «Vor dem Buchungsdruck beheben» / «Kein Zahlteil»
+ *     with the problems. The bill is `InvoicingService::bookingBill()`: for a DRAFT the payment
+ *     part the booking print WILL write, taken again from the target and the mandator (owner
+ *     2026-10-13, review H5 — the problems are exactly what the booking print refuses).
+ *
+ * Links to other documents, «ändern» of a payment and the journal stay in the window
+ * (`data-window-link`, `data-window-open`); the PDFs open a new tab.
+ *
+ * @var \Z77\Module\Debtor\Entities\Invoice $document  lines loaded
+ * @var \Z77\Module\Debtor\Invoicing\QrBill $bill
+ * @var list<\Z77\Module\Debtor\Entities\Invoice> $creditNotes
+ * @var \Z77\Shared\Money\Money|null $openAmount  final invoices only — after credit notes, payments, discount and loss
+ * @var list<\Z77\Module\Debtor\Entities\PaymentAllocation> $allocations  final invoices only
+ * @var list<\Z77\Module\Debtor\Entities\DunningNotice> $notices  final invoices only
+ * @var list<array<string, mixed>> $deliveries  final documents only — the outbox rows of `invoice:<id>` (InvoiceMails::deliveries(); [] without module-mailing)
+ * @var bool $ledgerKnown
+ * @var array<string, string> $states
+ * @var list<\Z77\Module\Debtor\Entities\InvoiceRevision> $revisions  the archived versions, oldest first (ADR-054 decision 11) — «Versionen» from revision 2 on
+ * @var \Z77\Module\Debtor\Entities\Invoice|null $predecessor  the document this one REPLACED (decision 10) — «Ersetzt»
+ * @var callable $fmt
+ * @var string $actionBase
+ */
+use Z77\Shared\Payment\Iban;
+
+$actionBase = $actionBase ?? '/backend/finance/invoice';
+$payment    = $bill->payment();
+$state      = $document->state();   // the five states (ADR-054) — the badge names it, its tone by the predicates
+$row        = static fn(string $label, string $html): string => '<div class="be-list__item"><div class="be-list__row"><span class="be-list__cell be-list__cell--muted">' . e($label) . '</span><span class="be-list__cell be-list__cell--wrap">' . $html . '</span></div></div>';
+/** A link that stays in the window (ADR-047): `data-window-link`; on a page a plain link. */
+$winLink    = static fn(string $href, string $label, string $title = ''): string
+    => '<a href="' . e($href) . '" data-window-link' . ($title !== '' ? ' title="' . e($title) . '"' : '') . '>' . e($label) . '</a>';
+$mask       = static fn(int $id): string => $actionBase . '/edit?id=' . $id;
+?>
+<div class="be-form__block" data-invoice-facts>
+    <div class="be-form__block-head">
+        <h3 class="be-list__section-title">Beleg</h3>
+        <span class="badge <?= $document->isPosted() ? 'badge--success' : ($document->isVoid() ? 'badge--muted' : ($document->isInJournal() ? 'badge--warning' : 'badge--info')) ?>" title="<?= e($states[$state->value]) ?>"><?= e($state->label()) ?></span>
+    </div>
+    <div class="be-list__table" style="--be-list-cols: 11rem minmax(12rem, 1fr)">
+        <?php if ($document->isCreditNote()): ?>
+        <?= raw($row('Gutschrift zu', $winLink($mask((int) $document->getCreditNoteOf()->getId()), $document->getCreditNoteOf()->documentName()))) ?>
+        <?php endif; ?>
+        <?php if ($document->getLedgerEntryRef() !== null): ?>
+        <?php $ref = $document->getLedgerEntryRef(); $journal = '/backend/finance/journal/detail?ref=' . rawurlencode($ref); ?>
+        <?= raw($row('Buchung', $ledgerKnown ? '<a href="' . e($journal) . '" data-window-open="' . e($journal) . '">' . e($ref) . '</a>' : e($ref))) ?>
+        <?php elseif ($document->isPosted()): ?>
+        <?= raw($row('Buchung', 'keine (Buchhaltung ausserhalb oder nichts zu buchen)')) ?>
+        <?php elseif ($document->isInJournal()): ?>
+        <?= raw($row('Buchung', 'noch keine — im <a href="/backend/finance/invoice-journal/list">Faktura-Journal</a>, verbucht mit «Journal verbuchen»')) ?>
+        <?php endif; ?>
+        <?php if ($document->getDocumentStamp() !== null): ?>
+        <?php /* The version stamp and who issued / posted it (ADR-054, owner 2026-10-23). */ ?>
+        <?= raw($row('ID', '<code>' . e($document->getDocumentStamp()) . '</code>' . ($document->getRevision() > 1 ? ' <small class="be-list__cell--muted">· Version ' . (int) $document->getRevision() . '</small>' : '') . ' <small class="be-list__cell--muted">· PDF unveränderlich abgelegt</small>')) ?>
+        <?php endif; ?>
+        <?php if ($document->getIssuedAt() !== null): ?>
+        <?= raw($row('Fakturiert', e($document->getIssuedAt()->format('d.m.Y H:i') . ' · ' . (string) $document->getIssuedBy()))) ?>
+        <?php endif; ?>
+        <?php if ($document->getPostedAt() !== null): ?>
+        <?= raw($row('Verbucht', e($document->getPostedAt()->format('d.m.Y H:i') . ' · ' . (string) $document->getPostedBy()))) ?>
+        <?php endif; ?>
+        <?php /* The Faktura-Journal's corrections (ADR-054 decisions 10, 11, 14 — step 4): links both ways, who / when / why, every archived version. */ ?>
+        <?php if ($document->getReplacedBy() !== null): ?>
+        <?= raw($row('Ersetzt durch', $winLink($mask((int) $document->getReplacedBy()->getId()), $document->getReplacedBy()->documentName()))) ?>
+        <?php endif; ?>
+        <?php if (($predecessor ?? null) !== null): ?>
+        <?= raw($row('Ersetzt', $winLink($mask((int) $predecessor->getId()), $predecessor->documentName()) . ($predecessor->getDocumentStamp() !== null ? ' <small class="be-list__cell--muted">· ID ' . e($predecessor->getDocumentStamp()) . ' — auf dem PDF: «ersetzt ' . e($predecessor->documentName()) . '»</small>' : ''))) ?>
+        <?php endif; ?>
+        <?php if ($document->isVoid() && $document->getVoidedAt() !== null): ?>
+        <?= raw($row($document->getReplacedBy() !== null ? 'Ersetzt am' : 'Gelöscht am', e($document->getVoidedAt()->format('d.m.Y H:i') . ' · ' . (string) $document->getVoidedBy()) . ' <small class="be-list__cell--muted">· ' . e((string) $document->getVoidReason()) . '</small>')) ?>
+        <?php endif; ?>
+        <?php if ($document->getReissueNeeded() !== null): ?>
+        <?= raw($row('Neu fakturieren', '<span class="badge badge--warning">nötig</span> ' . e($document->getReissueNeeded()) . ' <small class="be-list__cell--muted">· das Faktura-Journal ist gesperrt, bis die Quelle neu fakturiert ist</small>')) ?>
+        <?php endif; ?>
+        <?php if (count($revisions ?? []) > 1 || (($revisions ?? []) !== [] && $document->getRevision() > 1)): ?>
+        <?= raw($row('Versionen', implode('<br>', array_map(static fn($r) => '<a href="' . e($actionBase . '/pdf?id=' . (int) $document->getId() . '&revision=' . (int) $r->getRevision()) . '" target="_blank" rel="noopener">Version ' . (int) $r->getRevision() . '</a> <small class="be-list__cell--muted">· ID ' . e($r->getDocumentStamp()) . ' · ' . e($r->getCreatedAt()->format('d.m.Y H:i') . ' · ' . $r->getCreatedBy()) . ($r->getReason() !== null ? ' · ' . e($r->getReason()) : '') . '</small>', $revisions)))) ?>
+        <?php endif; ?>
+        <?php if ($allocations !== []): ?>
+        <?= raw($row('Zahlungen', implode('<br>', array_map(static function ($a) use ($fmt, $actionBase, $document, $winLink): string {
+            $p = $a->getPayment();
+            return e($p->getDate()->format('d.m.Y') . ' · ' . $a->kind()->label() . ' ' . $fmt($a->getAmount()))
+                . ($a->kind()->value === 'payment' && $p->getAccountNumber() !== '' ? ' <small class="be-list__cell--muted">· Konto ' . e($p->getAccountNumber()) . '</small>' : '')
+                . ($a->getLedgerEntryRef() !== null ? ' <small class="be-list__cell--muted">· Buchung ' . e($a->getLedgerEntryRef()) . '</small>' : '')
+                . ($p->getNote() !== null ? ' <small class="be-list__cell--muted">· ' . e($p->getNote()) . '</small>' : '')
+                . ' <small>' . $winLink($actionBase . '/payment?id=' . (int) $document->getId() . '&payment=' . (int) $p->getId(), 'ändern', 'Zahlung ändern oder löschen') . '</small>';
+        }, $allocations)))) ?>
+        <?php endif; ?>
+        <?php if ($openAmount !== null): ?>
+        <?= raw($row('Offen', $openAmount->isZero() ? '<span class="badge badge--success">bezahlt</span>' : e($fmt($openAmount)))) ?>
+        <?php endif; ?>
+        <?php if ($notices !== []): ?>
+        <?= raw($row('Mahnungen', implode('<br>', array_map(static function ($n) use ($fmt, $mask, $winLink): string {
+            $fee = $n->getFeeInvoice();
+            return e($n->getRun()->getRunDate()->format('d.m.Y') . ' · ' . $n->getLevelCode() . ' · offen damals ' . $fmt($n->getOpenAmount()))
+                . ($fee !== null ? ' <small class="be-list__cell--muted">· ' . $winLink($mask((int) $fee->getId()), $fee->documentName()) . ' ' . e($fmt($fee->getGrossTotal())) . '</small>' : '')
+                . ' <a class="be-list__cell--muted" href="/backend/finance/dunning/notice-pdf?id=' . (int) $n->getId() . '" target="_blank" rel="noopener">PDF</a>';
+        }, $notices)))) ?>
+        <?php endif; ?>
+        <?php if ($document->getSourceType() === 'dunning'): [$feeOfNumber, $feeLevel] = array_pad(explode(':', (string) $document->getSourceRef(), 2), 2, ''); ?>
+        <?= raw($row('Mahngebühr zu', 'Rechnung ' . e($feeOfNumber) . ' <small class="be-list__cell--muted">· Stufe ' . e($feeLevel) . '</small>')) ?>
+        <?php endif; ?>
+        <?php if ($creditNotes !== []): ?>
+        <?= raw($row('Gutschriften', implode(', ', array_map(fn($n) => $winLink($mask((int) $n->getId()), $n->documentName()) . ' ' . e($fmt($n->getGrossTotal())) . ($n->isDraft() ? ' (in Fakturierung)' : ''), $creditNotes)))) ?>
+        <?php endif; ?>
+        <?php if (!empty($deliveries)): /* the document by e-mail (step 3 of the mail plan): what the outbox holds for `invoice:<id>` */ ?>
+        <?= raw($row('E-Mail', implode('<br>', array_map(static fn(array $d): string => e(\Z77\Module\Debtor\Mail\InvoiceMails::deliveryLine($d)), $deliveries)))) ?>
+        <?php endif; ?>
+        <?php if ($document->getVatNote() !== null): /* a document without VAT: the note as printed, from the snapshot (owner 2026-10-22) */ ?>
+        <?= raw($row('MWST', '<span class="be-list__cell--muted">' . e($document->getVatNote()) . '</span>')) ?>
+        <?php endif; ?>
+        <?= raw($row('Erstellt', e($document->getCreatedAt()->format('d.m.Y H:i') . ' von ' . $document->getCreatedBy()) . ($document->getChangedAt() !== null ? ' · zuletzt ' . e($document->getChangedAt()->format('d.m.Y H:i') . ' von ' . $document->getChangedBy()) : ''))) ?>
+    </div>
+
+    <?php if (!$document->isCreditNote()): ?>
+    <span class="be-form__card-label">Zahlteil (QR-Rechnung)</span>
+    <div class="be-list__table" style="--be-list-cols: 11rem minmax(12rem, 1fr)" data-qr-bill="<?= $bill->isPending() ? 'pending' : ($bill->isPrintable() ? 'printable' : 'missing') ?>">
+        <?php if ($payment->hasPaymentPart()): ?>
+        <?= raw($row('Konto', e($bill->formattedAccount()) . ' <span class="badge ' . (Iban::isQrIban($payment->getAccount()) ? 'badge--success">QR-IBAN' : 'badge--muted">IBAN') . '</span> <small class="be-list__cell--muted">· Zahlungsziel ' . e($payment->getTargetCode()) . '</small>')) ?>
+        <?= raw($row('Zahlbar an', e(implode(', ', array_filter([$payment->getCreditorName(), trim($payment->getCreditorStreet() . ' ' . $payment->getCreditorHouseNo()), trim($payment->getCreditorCountry() . ' ' . $payment->getCreditorZip() . ' ' . $payment->getCreditorCity())]))))) ?>
+        <?php if ($bill->isPending()): ?>
+        <?= raw($row('Referenz', 'folgt mit der Belegnummer beim Fakturieren' . ($payment->getReferenceType() === 'QRR' ? ' (QR-Referenz)' : ' (keine Referenz, NON — die Mitteilung nennt das Dokument)'))) ?>
+        <?php else: ?>
+        <?= raw($row('Referenz', $payment->getReferenceType() === 'QRR' ? '<code>' . e($bill->formattedReference()) . '</code>' : 'keine (NON) · Mitteilung «' . e($payment->getMessage()) . '»')) ?>
+        <?php endif; ?>
+        <?php endif; ?>
+        <?php if (!$bill->isPrintable() && $bill->problems() !== []): ?>
+        <?= raw($row($bill->isPending() ? 'Vor dem Fakturieren beheben' : 'Kein Zahlteil', implode('<br>', array_map('e', $bill->problems())))) ?>
+        <?php endif; ?>
+    </div>
+    <?php endif; ?>
+</div>

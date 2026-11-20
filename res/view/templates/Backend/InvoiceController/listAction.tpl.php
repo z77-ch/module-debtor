@@ -1,0 +1,126 @@
+<?php
+/**
+ * The document list (P3 part 3) — one VIEW at a time (toolbar tabs):
+ * drafts in `invoicing` («Entwurf» in «Nr.» — no number before the booking
+ * print, owner 2026-10-10), issued («Fakturiert»), booked («Verbucht») invoices, credit notes (a
+ * draft among them likewise «Entwurf»), and the void documents «Ersetzt» (with their successor) /
+ * «Gelöscht» (with the reason) — ADR-054 rule 4: hidden from every other tab. A STANDARD LIST
+ * (listing.md, since 2026-10-08): the head and the search form are the
+ * kernel's partials over {@see \Z77\Module\Debtor\Ui\InvoiceListing}, the
+ * rows are this template's; no CSS and no JavaScript of its own:
+ *
+ *   - a state icon starts every row and is the way into the document: it
+ *     opens the document's ONE mask (`edit`, owner 2026-10-21 — a pencil for
+ *     a draft, a lock for a final document, which the mask shows read-only)
+ *     as a WINDOW (ADR-047, `data-window-open`), the href stays for a
+ *     ctrl-click and a browser without the script;
+ *   - every searchable cell is a `<label for>` of its column's search field;
+ *   - in the invoicing view each row carries a checkbox of the form
+ *     `#invoice-finalize` (GET to `confirm-finalize`) with the value
+ *     `{id}:{version}` — the version THIS row shows, so a document re-issued
+ *     before the batch runs is refused instead of finalized unseen;
+ *   - «Fakturieren …» (ADR-054, owner 2026-10-23; «Buchungsdruck …» since 2026-10-10, «Verbuchen …» that morning, «Definitiv stellen …» until then) is bound to that selection, so it stands in the
+ *     SELECTION BAR above the list (ADR-033 exception 2, rev. 2026-10-08),
+ *     a green confirm (`.be-btn--confirm`) submitting `#invoice-finalize`
+ *     through the `form` attribute. Without script the bar cannot count the
+ *     ticked rows («n ausgewählt»), so it always shows in the invoicing view
+ *     and names the count on the confirmation page instead;
+ *   - the whole list is a FETCH REGION (`invoice-find-list`): sort / page /
+ *     search reload only this part, and a save in a window opened from here
+ *     (the mask and what it links, «+ Rechnung») reloads it
+ *     (`refresh-region`, ADR-047 addendum 2026-10-10). The confirmation of
+ *     «Fakturieren …» is still a page (debtor.md DEBTOR-WIN-002); it
+ *     lands on the result list of the issued documents.
+ *
+ * @var list<\Z77\Module\Debtor\Entities\Invoice> $documents
+ * @var \Z77\Shared\Listing\ListDefinition $definition
+ * @var \Z77\Shared\Listing\ListState $state
+ * @var \Z77\Shared\Paging\Paging $paging
+ * @var array<string, string> $views
+ * @var bool $payments  the view «Verbucht»: three more cells per row — «Bezahlt am» (it carries the payment state: empty = offen, a date = bezahlt, a date «· Teil» = teilbezahlt, «gutgeschrieben»), «Zahlbetrag» (money only), «Zahlziel» — and «· Gutschrift <Nr.>» behind the name of an invoice a final credit note was issued against (owner 2026-11-19)
+ * @var array<int, \Z77\Module\Debtor\Services\PaymentState> $paymentStates  by document id
+ * @var array<int, \Z77\Module\Debtor\Repositories\PaymentFacts> $paymentFacts  by document id
+ * @var array<string, string> $states  state → German title
+ * @var callable $fmt
+ * @var string $actionBase
+ */
+$actionBase = $actionBase ?? '/backend/finance/invoice';
+$listUrl    = $actionBase . '/list';
+$link       = static fn(array $changes = []): string => $listUrl . '?' . $state->query($changes);
+$view       = $state->extra('view');
+$selectable = $view === 'invoicing';
+// The state icon: a pencil where the mask edits — a draft, and since step 4 an issued document of the mask
+// (revision or replacement, ADR-054 decision 12); a lock where it is read-only (posted, void, or issued from a source).
+$editableIn = static fn(\Z77\Module\Debtor\Entities\Invoice $d): bool => $d->isDraft() || ($d->isInJournal() && $d->getSourceType() === null);
+?>
+<div class="be-list" data-fetch-region="<?= e($definition->region()) ?>">
+    <div class="be-list__section">
+        <div class="be-list__section-header">
+            <?= $this->partial('partials/listReset', ['state' => $state, 'action' => $listUrl], 'Z77\Shared') ?>
+            <h2 class="be-list__section-title"><?= e($views[$view] ?? '') ?></h2>
+            <span class="be-list__section-badge" title="Dokumente"><?= $paging->total ?></span>
+        </div>
+
+        <?= $this->partial('partials/listFind', ['definition' => $definition, 'state' => $state, 'action' => $listUrl], 'Z77\\Shared') ?>
+        <?php if ($selectable): ?>
+        <form id="invoice-finalize" method="get" action="<?= e($actionBase) ?>/confirm-finalize"></form>
+        <div class="z77-form-actions">
+            <button type="submit" form="invoice-finalize" class="be-btn be-btn--confirm be-btn--sm">
+                <svg class="be-icon" width="14" height="14" aria-hidden="true"><use href="#icon-check"/></svg>
+                <span class="be-btn__label">Fakturieren …</span>
+            </button>
+            <small class="be-list__cell--muted">die angekreuzten Entwürfe nummerieren und drucken (ins Faktura-Journal, noch nicht verbucht) — die Bestätigung nennt Anzahl und Total</small>
+        </div>
+        <?php endif; ?>
+
+        <div class="be-list__frame">
+            <div class="be-list__table be-list__table--drop" style="<?= e($definition->style()) ?>">
+                <?= $this->partial('partials/listHead', ['definition' => $definition, 'state' => $state, 'action' => $listUrl], 'Z77\\Shared') ?>
+                <?php foreach ($documents as $document): ?>
+                <?php $docState = $document->state()->value; $url = $actionBase . '/edit?id=' . $document->getId(); $editableRow = $editableIn($document); ?>
+                <div class="be-list__item" data-invoice-id="<?= e((string) $document->getId()) ?>">
+                    <div class="be-list__row">
+                        <?php if ($selectable): ?>
+                        <span class="be-list__cell"><label class="be-choice"><input type="checkbox" class="be-choice__input" name="doc[]" form="invoice-finalize" value="<?= e($document->getId() . ':' . $document->getVersion()) ?>" aria-label="<?= e($document->documentName()) ?> auswählen"></label></span>
+                        <?php endif; ?>
+                        <a class="be-list__cell be-list__state be-list__state--<?= $editableRow ? 'editable' : 'closed' ?>" href="<?= e($url) ?>" data-window-open="<?= e($url) ?>" aria-label="<?= e($states[$docState]) ?>" title="<?= e($states[$docState]) ?>"><svg class="be-icon" width="14" height="14" aria-hidden="true"><use href="#icon-<?= $editableRow ? 'edit' : 'lock' ?>"/></svg></a>
+                        <label class="be-list__cell be-list__cell--num be-list__cell--mono" for="<?= e($definition->inputId('f_nr')) ?>"><?= $document->isNumbered() ? (int) $document->getNumber() : '<span class="be-list__cell--muted">Entwurf</span>' ?></label>
+                        <label class="be-list__cell" for="<?= e($definition->inputId('f_date')) ?>" data-priority="3"><?= e($document->getInvoiceDate()->format('d.m.Y')) ?></label>
+                        <label class="be-list__cell" for="<?= e($definition->inputId('f_name')) ?>"><?= e(trim($document->getAddress()->getFirstName() . ' ' . $document->getAddress()->getName())) ?><?= $document->isCreditNote() ? ' <small class="be-list__cell--muted">· zu ' . e($document->getCreditNoteOf()->documentName()) . ($document->isDraft() ? ' · in Fakturierung' : '') . '</small>' : '' ?><?php if (!empty($payments) && (($paymentFacts[$document->getId()] ?? null)?->creditNotes ?? []) !== []): ?> <small class="be-list__cell--muted" data-credit-notes>· Gutschrift <?= e(implode(', ', $paymentFacts[$document->getId()]->creditNotes)) ?></small><?php endif; ?><?= $document->getReplacedBy() !== null ? ' <small class="be-list__cell--muted">· ersetzt durch ' . e($document->getReplacedBy()->documentName()) . '</small>' : '' ?><?= $document->getVoidReason() !== null && $docState === 'deleted' ? ' <small class="be-list__cell--muted">· ' . e($document->getVoidReason()) . '</small>' : '' ?></label>
+                        <span class="be-list__cell" data-priority="2"><?= $document->isCreditNote() ? '' : e($document->getDueDate()->format('d.m.Y')) ?></span>
+                        <label class="be-list__cell be-list__cell--num" for="<?= e($definition->inputId('f_amount')) ?>"><?= e($fmt($document->getGrossTotal())) ?></label>
+                        <?php if (!empty($payments)): ?>
+                        <?php
+                        // «Bezahlt am» carries the payment STATE (owner 2026-11-19): empty = offen, a date = bezahlt,
+                        // a date «· Teil» = teilbezahlt, «gutgeschrieben» = cancelled by credit note, never paid.
+                        $pay     = $paymentStates[$document->getId()] ?? null;
+                        $facts   = $paymentFacts[$document->getId()] ?? null;
+                        $paidOn  = (string) $facts?->paidOnLabel();
+                        $payCell = match ($pay?->status) {
+                            \Z77\Module\Debtor\Services\PaymentState::CREDITED => 'gutgeschrieben',
+                            \Z77\Module\Debtor\Services\PaymentState::PAID     => $paidOn !== '' ? $paidOn : 'bezahlt',
+                            \Z77\Module\Debtor\Services\PaymentState::PARTIAL  => trim($paidOn . ' · Teil', ' ·'),
+                            default                                              => '',
+                        };
+                        ?>
+                        <span class="be-list__cell" data-payment-state="<?= e((string) $pay?->status) ?>" title="<?= e((string) $pay?->label()) ?>"><?= e($payCell) ?></span>
+                        <span class="be-list__cell be-list__cell--num" data-priority="2" data-payment-paid><?= $facts?->paid !== null ? e($fmt($facts->paid)) : '' ?></span>
+                        <span class="be-list__cell be-list__cell--muted" data-priority="3" data-payment-target><?= e((string) $facts?->targetLabel()) ?></span>
+                        <?php endif; ?>
+
+                    </div>
+                </div>
+                <?php endforeach; ?>
+            </div>
+        </div>
+        <?php if ($documents === []): ?>
+        <p class="be-list__empty"><?= $state->isActive() ? 'Kein Dokument gefunden.' : 'Keine Dokumente in dieser Ansicht.' ?></p>
+        <?php endif; ?>
+        <?= $this->partial('partials/pager', [
+            'paging'      => $paging,
+            'pageLink'    => static fn(int $p): string => $link(['page' => $p]),
+            'unit'        => 'Dokumente',
+            'regionLinks' => true,
+        ], 'Z77\\Shared') ?>
+    </div>
+</div>
